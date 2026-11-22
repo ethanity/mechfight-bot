@@ -57,6 +57,12 @@ class Bot:
         self.cover_t = -99.0
         self.loot_ignore = {}        # id -> time until which we ignore it
         self.mode = "start"
+        self.foes = {}               # enemy id -> what we last knew (pos, vel, hp, when, damage it did to us)
+        self.target_id = None        # who we're focusing
+        self.fight_spot = None       # cached isolation / hiding spot
+        self.fight_spot_t = -99.0
+        self.fight_spot_kind = None
+        self.rear_hit_t = -99.0
 
     # ------------------------------------------------------------------ helpers
     def zone_now(self, z, t):
@@ -177,10 +183,17 @@ class Bot:
             et = ev.get("type")
             if et == "damaged":
                 self.last_hit_t = t
-                if ev.get("by") is not None:
-                    self.attacker = ev["by"]
+                by = ev.get("by")
+                if by is not None:
+                    self.attacker = by
+                    if by < 100:
+                        f = self.foes.setdefault(by, {"pos": None, "t": -99.0, "dmg": 0.0, "hit_t": -99.0})
+                        f["dmg"] = f.get("dmg", 0.0) * 0.5 ** max(0.0, t - f.get("hit_t", t)) + ev.get("amount", 0)
+                        f["hit_t"] = t
                 if ev.get("bearing") is not None:
                     self.hit_bearing = ev["bearing"]
+                if ev.get("rear"):
+                    self.rear_hit_t = t
             elif et == "hit":
                 self.last_deal_t = t
             elif et == "take_failed":
@@ -216,15 +229,26 @@ class Bot:
         # we are "home" if already well inside the next circle
         home_ok = d_next < rn * 0.8
 
-        # ---- choose a target to shoot
-        target = None
-        if enemies:
-            def score(m):
-                s = m["_d"] * (0.4 + m.get("hp", 1000) / max(1.0, m.get("max_hp", 1400)))
-                if m["id"] == self.attacker and since_hit < 4:
-                    s *= 0.5
-                return s
-            target = min(enemies, key=score)
+        # ---- remember enemies (obs keeps tracking them 5 s after they leave view; we keep 12 s)
+        for m in enemies:
+            f = self.foes.setdefault(m["id"], {"dmg": 0.0, "hit_t": -99.0})
+            f.update(pos=m["pos"], vel=m.get("vel", [0, 0, 0]), hp=m.get("hp", 1400),
+                     max_hp=m.get("max_hp", 1400), t=t)
+        for k in [k for k, f in self.foes.items() if t - f.get("t", -99) > 12 and t - f.get("hit_t", -99) > 12]:
+            del self.foes[k]
+        active = [(k, f) for k, f in self.foes.items()
+                  if f.get("pos") and t - f["t"] < 8 and math.dist(f["pos"][:2], (x, y)) < 160]
+        # which of them can probably see (and shoot) us right now
+        body = (x, y, zf + 4.5)
+        exposed = []
+        for k, f in sorted(active, key=lambda kf: math.dist(kf[1]["pos"][:2], (x, y)))[:6]:
+            p = f["pos"]
+            if self.nav.los((p[0], p[1], p[2] + 8), body):
+                exposed.append(k)
+        n_exp = len(exposed)
+
+        # ---- target: focus whoever will die fastest, and stick with them
+        target = self.choose_target(enemies, me, x, y, zf, t)
         npc_target = None
         if not enemies and npcs and hp_frac > 0.5:
             close = [n for n in npcs if n["_d"] < 90]
@@ -235,18 +259,30 @@ class Bot:
         goal = None
         mode = "hold"
         boost = False
-        threat = target or (min(npcs, key=lambda n: n["_d"]) if npcs and since_hit < 2 else None)
+        finishing = target is not None and target.get("hp", 1400) < 160 and target["_d"] < 120
+        hurt = hp_frac < 0.5 or (hp_frac < 0.7 and n_exp >= 2) or (hp_frac < 0.85 and n_exp >= 3)
+        npc_threat = min(npcs, key=lambda n: n["_d"]) if npcs and since_hit < 2 else None
         if urgent:
             mode = "zone"
             goal = self.spot
             boost = not me["in_zone"] or me["energy"] > 40
-        elif threat is not None and hp_frac < 0.4 and (since_hit < 4 or threat["_d"] < 60):
+        elif active and hurt and not finishing:
+            # get out of everyone's sight and regenerate
             mode = "retreat"
-            c = self.find_cover(x, y, threat["pos"], z, t)
-            goal = c or self.spot
+            goal = self.fight_pos(x, y, zf, z, t, active, None, "hide") or self.spot
+            boost = me["energy"] > 20
+        elif n_exp >= 2:
+            # outnumbered: move so that only our target can see us
+            mode = "isolate"
+            goal = self.fight_pos(x, y, zf, z, t, active, self.target_id, "isolate") or self.spot
+        elif npc_threat is not None and hp_frac < 0.4:
+            mode = "retreat"
+            goal = self.find_cover(x, y, npc_threat["pos"], z, t) or self.spot
             boost = me["energy"] > 20
         else:
-            goal = self.loot_goal(obs, me, x, y, zf, z, t, enemies) if not enemies else None
+            goal = None
+            if n_exp == 0 and (not enemies or hp_frac > 0.5):
+                goal = self.loot_goal(obs, me, x, y, zf, z, t, enemies)
             if goal is not None:
                 mode = "loot"
             elif not home_ok or math.hypot(self.spot[0] - x, self.spot[1] - y) > 6:
@@ -255,6 +291,10 @@ class Bot:
             else:
                 mode = "fight" if enemies else "hold"
         self.mode = mode
+        # route around enemies we know about (re-plan every 2 s while they're around)
+        self.plan.avoid = [(f["pos"][0], f["pos"][1], 50.0, 5.0) for k, f in active if k != self.target_id or mode == "retreat"]
+        if active and t - self.plan.planned_t > 2.0:
+            self.plan.replan()
 
         # ---- legs
         mv = (0.0, 0.0)
@@ -309,13 +349,93 @@ class Bot:
         # ---- torso: aim and fire
         aim, fire, extra = self.weapons(obs, me, x, y, zf, target, npc_target, mode, t)
         act.update(extra)
+        # shot in the back by someone we can't see: turn to face them (rear hits do 1.5x)
+        if (t - self.rear_hit_t < 0.8 and self.attacker is not None and self.attacker < 100
+                and not any(e["id"] == self.attacker for e in enemies) and self.hit_bearing is not None):
+            aim = [self.hit_bearing, 0.0]
         if aim is None:
             aim = self.look(obs, me, mv, t)
 
         act.update(move=[round(mv[0], 3), round(mv[1], 3)], boost=bool(boost), jump=jump,
                    aim=[round(aim[0], 4), round(aim[1], 4)], fire=fire)
-        mf.draw.label(f"{mode} hp{me['hp']:.0f} e{len(enemies)}")
+        mf.draw.label(f"{mode} hp{me['hp']:.0f} e{len(enemies)} x{n_exp}")
         return act
+
+    # ------------------------------------------------------------------ fights
+    def choose_target(self, enemies, me, x, y, zf, t):
+        """Lowest 'shots needed to kill' wins: weak and close enemies first. Sticky, so we finish kills."""
+        if not enemies:
+            self.target_id = None
+            return None
+        muzzle = (x, y, zf + me["stats"].get("muzzle_height", 7))
+        best, bs = None, 1e18
+        for m in enemies:
+            d = m["_d"]
+            hp = m.get("hp", 1400)
+            p = m["pos"]
+            hit = max(0.15, 1.0 - d / 220.0)            # rough chance a gun shot lands at this range
+            s = hp / hit
+            if not self.nav.los(muzzle, (p[0], p[1], p[2] + 4.5)):
+                s *= 3.0                                 # can't shoot it from here
+            if hp < 200:
+                s *= 0.4                                 # nearly dead: finish it
+            if m["id"] == self.target_id:
+                s *= 0.6                                 # stick with our target
+            f = self.foes.get(m["id"])
+            if f and t - f.get("hit_t", -99) < 2:
+                s *= 0.6                                 # it's hurting us right now
+            if s < bs:
+                best, bs = m, s
+        self.target_id = best["id"]
+        return best
+
+    def fight_pos(self, x, y, zf, z, t, active, want_id, kind):
+        """Pick a nearby spot by who can see it.
+        kind 'hide': nobody can see it.  kind 'isolate': only enemy `want_id` can see it.
+        Also prefers being far from enemies and close to where we are. Cached ~0.8 s."""
+        if self.fight_spot and self.fight_spot_kind == kind and t - self.fight_spot_t < 0.8:
+            return self.fight_spot
+        nav = self.nav
+        cx, cy, r = self.zone_now(z, t)
+        ncx, ncy = z["next_center"]
+        rn = z["next_radius"]
+        zone_pull = z["shrink_start"] - t < 20 or math.hypot(x - ncx, y - ncy) > rn
+        foes = sorted(active, key=lambda kf: math.dist(kf[1]["pos"][:2], (x, y)))[:5]
+        eyes = [(k, (f["pos"][0], f["pos"][1], f["pos"][2] + 8)) for k, f in foes]
+        cands = [(x, y, 0.0)]
+        for dist in (7.0, 14.0, 24.0, 36.0):
+            off = (dist * 7) % 36
+            for a in range(0, 360, 36):
+                ang = math.radians(a + off)
+                cands.append((x + dist * math.cos(ang), y + dist * math.sin(ang), dist))
+        best, bs = None, -1e18
+        for px, py, dist in cands:
+            if math.hypot(px - cx, py - cy) > r - 8:
+                continue
+            if dist and not nav.free_xy(px, py):
+                continue
+            body = (px, py, nav.ground_at(px, py) + 5)
+            seen_by = 0
+            sees_target = False
+            crowd = 0.0
+            for k, e in eyes:
+                vis = nav.los(e, body)
+                if k == want_id:
+                    sees_target = vis
+                elif vis:
+                    seen_by += 1
+                crowd += max(0.0, 45.0 - math.dist(e[:2], (px, py))) / 15.0
+            s = -10.0 * seen_by - crowd - 0.12 * dist
+            if kind == "isolate" and sees_target:
+                s += 6.0
+            if dist and not nav.line_free(x, y, px, py):
+                s -= 3.0                                  # have to walk around something to get there
+            if zone_pull:
+                s -= 0.1 * max(0.0, math.hypot(px - ncx, py - ncy) - rn * 0.8)
+            if s > bs:
+                best, bs = (px, py), s
+        self.fight_spot, self.fight_spot_t, self.fight_spot_kind = best, t, kind
+        return best
 
     # ------------------------------------------------------------------ pieces
     def loot_goal(self, obs, me, x, y, zf, z, t, enemies):
@@ -465,7 +585,7 @@ class Bot:
             if dist < gw["stats"]["range"] and gw.get("reload", 0) == 0 and self.aim_ok(me, g_aim, dist, radius, 1.2):
                 fire[gun_i] = True
         # resting from a retreat: don't shoot unless they're close (shooting stops regen)
-        if mode == "retreat" and tgt is not None and dist > 50 and t - self.last_hit_t > 1.5:
+        if mode == "retreat" and tgt is not None and tgt.get("hp", 1400) >= 160 and t - self.last_hit_t > 1.0:
             fire = [False, False] if not (alt and alt["kind"] == "laser" and alt.get("charge", 0) > 0) else fire
         return aim, fire, extra
 

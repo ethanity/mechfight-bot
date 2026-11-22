@@ -118,14 +118,20 @@ class Nav:
         return True
 
     # --- path planning -------------------------------------------------------
-    def astar(self, s, goal, max_expand=60000):
+    def astar(self, s, goal, max_expand=60000, avoid=None):
         """Generator. Yields None while working (caller checks its clock), then a list of
-        cells from s to goal, or [] if unreachable / too far."""
+        cells from s to goal, or [] if unreachable / too far.
+        avoid: list of (x, y, radius_m, weight): walking within radius of (x, y) costs up to
+        `weight` extra cells per step (used to route around enemies)."""
         self.sid += 1
         sid = self.sid
         g, stamp, parent, blocked, nbrs = self.g, self.stamp, self.parent, self.blocked, self.nbrs
         nx = self.nx
         gj, gi = divmod(goal, nx)
+        pen = []
+        for ax, ay, ar, aw in (avoid or ()):
+            rc = ar / self.cell
+            pen.append(((ax - self.minx) / self.cell, (ay - self.miny) / self.cell, rc * rc, aw))
 
         def h(k):
             j, i = divmod(k, nx)
@@ -143,9 +149,12 @@ class Nav:
                 continue
             if k == goal:
                 path = []
-                while k != -1:
+                while k != -1 and len(path) <= exp + 1:  # bounded: a corrupted trail can't loop forever
                     path.append(k)
                     k = parent[k]
+                if k != -1:
+                    yield []
+                    return
                 path.reverse()
                 yield path
                 return
@@ -154,6 +163,9 @@ class Nav:
                 break
             if exp & 255 == 0:
                 yield None
+                if self.sid != sid:  # another search reused the scratch arrays while we were paused
+                    yield []
+                    return
             for off, c, o1, o2 in nbrs:
                 kk = k + off
                 if blocked[kk]:
@@ -161,6 +173,12 @@ class Nav:
                 if o1 and (blocked[k + o1] or blocked[k + o2]):
                     continue  # no cutting corners
                 ng = gc + c
+                if pen:
+                    j2, i2 = divmod(kk, nx)
+                    for ai, aj, r2, aw in pen:
+                        d2 = (i2 - ai) ** 2 + (j2 - aj) ** 2
+                        if d2 < r2:
+                            ng += aw * (1.0 - d2 / r2)
                 if stamp[kk] != sid or ng < g[kk] - 1e-6:
                     stamp[kk] = sid
                     g[kk] = ng
@@ -180,6 +198,8 @@ class Planner:
         self.goal = None
         self.idx = 0
         self.failed_until = 0.0
+        self.avoid = []          # (x, y, radius_m, weight) areas to route around
+        self.planned_t = -99.0
 
     def set_goal(self, gx, gy, t):
         nav = self.nav
@@ -215,8 +235,9 @@ class Planner:
             if t < self.failed_until:
                 return nav.xy(self.goal)
             if self.job is None or self.job_goal != self.goal:
-                self.job = nav.astar(start, self.goal)
+                self.job = nav.astar(start, self.goal, avoid=list(self.avoid))
                 self.job_goal = self.goal
+                self.planned_t = t
             res = None
             while time.perf_counter() < deadline:
                 res = next(self.job, [])
