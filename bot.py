@@ -17,7 +17,19 @@ import mechfight as mf
 from nav import Nav, Planner
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-WEAPON_RANK = {"laser": 3, "lightning": 2, "mortar": 1, "gun": 0}
+# lightning: 240 dmg/s within 45 m and aims itself -> best for aggressive close fights
+WEAPON_RANK = {"lightning": 3, "laser": 2, "mortar": 1, "gun": 0}
+HUNT_HP = 0.55        # hunt while above this fraction of max HP
+CLOSE_IN = 26.0       # distance we try to fight at (gun hits more, lightning reaches 45 m)
+GROUP_R = 50.0        # an enemy with 2+ friends within this many meters is "in a group": don't push it
+RETREAT_HP = 0.5      # below this fraction of max HP (with enemies around), hide and regenerate
+CUBE_GRAB = 25.0      # grab cubes this close even mid-fight
+# Simulator experiments can override any of the constants above, e.g. MF_PARAMS='{"HUNT_HP": 0.7}'.
+# (The environment variable is never set in real matches.)
+try:
+    globals().update(__import__("json").loads(os.environ.get("MF_PARAMS", "{}")))
+except ValueError:
+    pass
 UPGRADE_RANK = ["armor", "plating", "nanites", "gun_damage", "gun_rate", "laser_charge", "laser_damage",
                 "lightning_damage", "gun_mag", "gun_velocity", "servos", "mortar_reload", "sensors",
                 "gyros", "reactor", "capacitor", "jets", "mortar_splash", "mortar_velocity"]
@@ -260,7 +272,15 @@ class Bot:
         mode = "hold"
         boost = False
         finishing = target is not None and target.get("hp", 1400) < 160 and target["_d"] < 120
-        hurt = hp_frac < 0.5 or (hp_frac < 0.7 and n_exp >= 2) or (hp_frac < 0.85 and n_exp >= 3)
+        hurt = hp_frac < RETREAT_HP or (hp_frac < RETREAT_HP + 0.2 and n_exp >= 2) or \
+            (hp_frac < RETREAT_HP + 0.35 and n_exp >= 3)
+        # power cubes lying right next to us: grab them even mid-fight (+4% HP and damage each)
+        cube_near = None
+        if not urgent and n_exp <= 1:
+            cs = [c for c in obs.get("cubes", []) if math.dist(c["pos"][:2], (x, y)) < CUBE_GRAB
+                  and abs(c["pos"][2] - zf) < 4]
+            if cs:
+                cube_near = min(cs, key=lambda c: math.dist(c["pos"][:2], (x, y)))["pos"][:2]
         npc_threat = min(npcs, key=lambda n: n["_d"]) if npcs and since_hit < 2 else None
         if urgent:
             mode = "zone"
@@ -271,6 +291,9 @@ class Bot:
             mode = "retreat"
             goal = self.fight_pos(x, y, zf, z, t, active, None, "hide") or self.spot
             boost = me["energy"] > 20
+        elif cube_near is not None and not (active and hurt):
+            mode = "cube"
+            goal = cube_near
         elif n_exp >= 2:
             # outnumbered: move so that only our target can see us
             mode = "isolate"
@@ -279,6 +302,12 @@ class Bot:
             mode = "retreat"
             goal = self.find_cover(x, y, npc_threat["pos"], z, t) or self.spot
             boost = me["energy"] > 20
+        elif hp_frac > HUNT_HP and (me["weapons"][1] is not None or t > 45 or enemies) and \
+                (hg := self.hunt_goal(enemies, target, active, obs, x, y, z, t)) is not None:
+            # go get them: an isolated enemy we can see, remember, or hear
+            mode = "hunt"
+            goal = hg if hg != "here" else None
+            boost = target is None and me["energy"] > 60
         else:
             goal = None
             if n_exp == 0 and (not enemies or hp_frac > 0.5):
@@ -307,7 +336,7 @@ class Bot:
         if t > self.strafe_flip_t:
             self.strafe_sign = -self.strafe_sign
             self.strafe_flip_t = t + random.uniform(0.8, 1.8)
-        if target is not None and mode in ("fight", "hold", "rotate"):
+        if target is not None and mode in ("fight", "hold", "rotate", "hunt", "cube"):
             tx, ty = unit(target["pos"][0] - x, target["pos"][1] - y)
             px_, py_ = -ty * self.strafe_sign, tx * self.strafe_sign
             w = 0.7 if mv == (0.0, 0.0) else 0.45
@@ -437,6 +466,57 @@ class Bot:
         self.fight_spot, self.fight_spot_t, self.fight_spot_kind = best, t, kind
         return best
 
+    def hunt_goal(self, enemies, target, active, obs, x, y, z, t):
+        """Where to go to start the next fight. 'here' = already in range, fight in place. None = no hunt."""
+        cx, cy, r = self.zone_now(z, t)
+        ncx, ncy = z["next_center"]
+        rn = z["next_radius"]
+        late = z["shrink_start"] - t < 15
+
+        def ok(p):
+            if math.hypot(p[0] - cx, p[1] - cy) > r - 15:
+                return False
+            if late and math.hypot(p[0] - ncx, p[1] - ncy) > rn * 0.9:
+                return False
+            return True
+
+        def friends(pid, p):
+            return sum(1 for k, f in self.foes.items() if k != pid and f.get("pos") and t - f["t"] < 10
+                       and math.dist(f["pos"][:2], p[:2]) < GROUP_R)
+
+        # 1) our target is visible: close in unless it's sitting in a group
+        if target is not None:
+            p = target["pos"]
+            if friends(target["id"], p) >= 2:
+                return None
+            if target["_d"] <= CLOSE_IN + 4:
+                return "here"
+            return (p[0], p[1]) if ok(p) else None
+        # 2) someone we saw recently: weakest / most isolated / closest
+        best, bs = None, 1e18
+        for k, f in self.foes.items():
+            if not f.get("pos") or t - f["t"] > 15 or not ok(f["pos"]):
+                continue
+            p = f["pos"]
+            s = math.dist(p[:2], (x, y)) + 90 * friends(k, p) + 0.05 * f.get("hp", 1400)
+            if s < bs:
+                best, bs = (p[0], p[1]), s
+        if best is not None and bs < 400:
+            return best
+        # 3) follow the sound of fighting or footsteps
+        snd = [s for s in obs.get("sounds", []) if s["kind"] in
+               ("gun", "laser", "lightning", "mortar", "step", "boost", "jet", "reload", "laser_charge")]
+        if snd:
+            s = min(snd, key=lambda s: {"near": 0, "mid": 1, "far": 2}[s["dist"]])
+            d = {"near": 40.0, "mid": 110.0, "far": 200.0}[s["dist"]]
+            p = (x + d * math.cos(s["bearing"]), y + d * math.sin(s["bearing"]))
+            if ok(p):
+                self.sound_goal, self.sound_goal_t = p, t
+        sg = getattr(self, "sound_goal", None)
+        if sg is not None and t - self.sound_goal_t < 6 and math.hypot(sg[0] - x, sg[1] - y) > 8:
+            return sg
+        return None
+
     # ------------------------------------------------------------------ pieces
     def loot_goal(self, obs, me, x, y, zf, z, t, enemies):
         """Pick something worth walking to: drop, better weapon, cube, crate, NPC. None = nothing."""
@@ -473,7 +553,8 @@ class Bot:
                 continue
             if slots[1] is not None and WEAPON_RANK.get(pk["kind"], 0) <= worst:
                 continue
-            if not ok(pk["pos"], 70):
+            reach = 130 if (slots[1] is None and t < 90) else 70   # early on, go out of our way for a weapon
+            if not ok(pk["pos"], reach):
                 continue
             d = math.dist(pk["pos"][:2], (x, y))
             if best is None or d < best[0]:
