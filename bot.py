@@ -24,6 +24,12 @@ CLOSE_IN = 26.0       # distance we try to fight at (gun hits more, lightning re
 GROUP_R = 50.0        # an enemy with 2+ friends within this many meters is "in a group": don't push it
 RETREAT_HP = 0.5      # below this fraction of max HP (with enemies around), hide and regenerate
 CUBE_GRAB = 25.0      # grab cubes this close even mid-fight
+FARM_CUBES = 10       # farm drones/crates for power cubes until we have this many (stats cap at 10)
+FARM_RANGE = 140.0    # how far we'll go for a drone or crate
+FARM_HP = 0.45        # only farm above this fraction of max HP
+CRATE_STANDOFF = 30.0 # shoot crates from about this far
+NPC_STANDOFF = 40.0   # shoot drones from about this far (they shoot back within ~45 m)
+FIGHT_RANGE = 80.0    # in fights keep about this distance (house bots miss more at range; 0 = close to CLOSE_IN)
 # Simulator experiments can override any of the constants above, e.g. MF_PARAMS='{"HUNT_HP": 0.7}'.
 # (The environment variable is never set in real matches.)
 try:
@@ -75,6 +81,8 @@ class Bot:
         self.fight_spot_t = -99.0
         self.fight_spot_kind = None
         self.rear_hit_t = -99.0
+        self.crates_seen = {}        # crate id -> position (crates never move; only listed while visible)
+        self.farm = None             # current farming target: ("npc"|"crate", id, pos)
 
     # ------------------------------------------------------------------ helpers
     def zone_now(self, z, t):
@@ -218,6 +226,8 @@ class Bot:
             act["pick"] = ranks.index(min(ranks))
 
         # ---- what's around
+        for c in obs.get("crates", []):
+            self.crates_seen[c["id"]] = c["pos"]
         enemies = [m for m in obs.get("mechs", []) if m["kind"] == "mech"]
         npcs = [m for m in obs.get("mechs", []) if m["kind"] == "npc"]
         for m in enemies:
@@ -302,23 +312,33 @@ class Bot:
             mode = "retreat"
             goal = self.find_cover(x, y, npc_threat["pos"], z, t) or self.spot
             boost = me["energy"] > 20
+        elif target is not None and hp_frac > HUNT_HP and \
+                (hg := self.hunt_goal(enemies, target, active, obs, x, y, z, t)) is not None:
+            # an isolated enemy in sight: go get it
+            mode = "hunt"
+            goal = hg if hg != "here" else None
+        elif n_exp == 0 and (not enemies or hp_frac > 0.5) and \
+                (lg := self.loot_goal(obs, me, x, y, zf, z, t, enemies)) is not None:
+            mode = "loot"
+            goal = lg
+        elif me["cubes"] < FARM_CUBES and hp_frac > FARM_HP and n_exp == 0 and \
+                (fg := self.farm_goal(obs, me, npcs, x, y, zf, z, t)) is not None:
+            # power up: shoot drones and crates for cubes (+4% HP and damage each, upgrades at 1/3/6/10)
+            mode = "farm"
+            goal = fg
         elif hp_frac > HUNT_HP and (me["weapons"][1] is not None or t > 45 or enemies) and \
                 (hg := self.hunt_goal(enemies, target, active, obs, x, y, z, t)) is not None:
-            # go get them: an isolated enemy we can see, remember, or hear
+            # go find someone we remember or hear
             mode = "hunt"
             goal = hg if hg != "here" else None
             boost = target is None and me["energy"] > 60
+        elif not home_ok or math.hypot(self.spot[0] - x, self.spot[1] - y) > 6:
+            mode = "rotate" if not enemies else "fight"
+            goal = self.spot
         else:
-            goal = None
-            if n_exp == 0 and (not enemies or hp_frac > 0.5):
-                goal = self.loot_goal(obs, me, x, y, zf, z, t, enemies)
-            if goal is not None:
-                mode = "loot"
-            elif not home_ok or math.hypot(self.spot[0] - x, self.spot[1] - y) > 6:
-                mode = "rotate" if not enemies else "fight"
-                goal = self.spot
-            else:
-                mode = "fight" if enemies else "hold"
+            mode = "fight" if enemies else "hold"
+        if mode != "farm":
+            self.farm = None
         self.mode = mode
         # route around enemies we know about (re-plan every 2 s while they're around)
         self.plan.avoid = [(f["pos"][0], f["pos"][1], 50.0, 5.0) for k, f in active if k != self.target_id or mode == "retreat"]
@@ -332,6 +352,18 @@ class Bot:
             steer = self.plan.step(x, y, deadline, t)
             if steer is not None and math.hypot(goal[0] - x, goal[1] - y) > 2.5:
                 mv = unit(steer[0] - x, steer[1] - y)
+        # farming: stop at a safe distance once we can shoot it
+        if mode == "farm" and self.farm is not None:
+            kind, _, fp = self.farm
+            sd = CRATE_STANDOFF if kind == "crate" else NPC_STANDOFF
+            muzzle = (x, y, zf + st.get("muzzle_height", 7))
+            if math.dist(fp[:2], (x, y)) < sd and self.nav.los(muzzle, (fp[0], fp[1], fp[2] + 1.2)):
+                mv = (0.0, 0.0)
+        # long-range style: back off if they get closer than our fighting distance
+        if FIGHT_RANGE > 0 and target is not None and mode in ("hunt", "fight") and target["_d"] < FIGHT_RANGE - 15:
+            ax, ay = unit(x - target["pos"][0], y - target["pos"][1])
+            if self.nav.free_xy(x + ax * 6, y + ay * 6):
+                mv = unit(mv[0] + ax, mv[1] + ay)
         # strafe while fighting so we're harder to hit
         if t > self.strafe_flip_t:
             self.strafe_sign = -self.strafe_sign
@@ -489,7 +521,7 @@ class Bot:
             p = target["pos"]
             if friends(target["id"], p) >= 2:
                 return None
-            if target["_d"] <= CLOSE_IN + 4:
+            if target["_d"] <= (FIGHT_RANGE + 10 if FIGHT_RANGE > 0 else CLOSE_IN + 4):
                 return "here"
             return (p[0], p[1]) if ok(p) else None
         # 2) someone we saw recently: weakest / most isolated / closest
@@ -516,6 +548,47 @@ class Bot:
         if sg is not None and t - self.sound_goal_t < 6 and math.hypot(sg[0] - x, sg[1] - y) > 8:
             return sg
         return None
+
+    def farm_goal(self, obs, me, npcs, x, y, zf, z, t):
+        """Nearest worthwhile drone (2 cubes) or remembered crate (1 cube) inside the zone."""
+        nav = self.nav
+        cx, cy, r = self.zone_now(z, t)
+        ncx, ncy = z["next_center"]
+        rn = z["next_radius"]
+        late = z["shrink_start"] - t < 20
+
+        def ok(p):
+            if math.hypot(p[0] - cx, p[1] - cy) > r - 15:
+                return False
+            if late and math.hypot(p[0] - ncx, p[1] - ncy) > rn * 0.9:
+                return False
+            return True
+
+        # forget crates that should be visible but aren't (destroyed)
+        vis = {c["id"] for c in obs.get("crates", [])}
+        eye = (x, y, zf + 8)
+        for cid, p in list(self.crates_seen.items()):
+            if cid not in vis and math.dist(p[:2], (x, y)) < 40 and nav.los(eye, (p[0], p[1], p[2] + 1.2)):
+                del self.crates_seen[cid]
+        best, bs = None, 1e18
+        for n in npcs:
+            p = n["pos"]
+            if n["_d"] > FARM_RANGE or not ok(p):
+                continue
+            s = n["_d"] * 0.8 + n.get("hp", 350) * 0.05
+            if s < bs:
+                best, bs = ("npc", n["id"], p), s
+        for cid, p in self.crates_seen.items():
+            d = math.dist(p[:2], (x, y))
+            if d > FARM_RANGE or not ok(p):
+                continue
+            if p[2] - nav.ground_at(p[0], p[1]) > 3:
+                continue  # on a roof: its cube would land where we can't walk
+            s = d * 1.3
+            if s < bs:
+                best, bs = ("crate", cid, p), s
+        self.farm = best
+        return None if best is None else (best[2][0], best[2][1])
 
     # ------------------------------------------------------------------ pieces
     def loot_goal(self, obs, me, x, y, zf, z, t, enemies):
@@ -594,7 +667,13 @@ class Bot:
         # what are we shooting at?
         tgt = target or npc_target
         crate = None
-        if tgt is None and mode in ("hold", "rotate", "loot"):
+        if tgt is None and mode == "farm" and self.farm is not None:
+            kind, fid, _ = self.farm
+            if kind == "npc":
+                tgt = next((m for m in obs.get("mechs", []) if m["id"] == fid), None)
+            else:
+                crate = next((c for c in obs.get("crates", []) if c["id"] == fid), None)
+        if tgt is None and crate is None and mode in ("hold", "rotate", "loot", "cube", "farm"):
             cs = [c for c in obs.get("crates", []) if math.dist(c["pos"], me["pos"]) < 90]
             if cs:
                 crate = min(cs, key=lambda c: math.dist(c["pos"], me["pos"]))
