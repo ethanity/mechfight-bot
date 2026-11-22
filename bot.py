@@ -28,17 +28,21 @@ FARM_CUBES = 10       # farm drones/crates for power cubes until we have this ma
 FARM_RANGE = 140.0    # how far we'll go for a drone or crate
 FARM_HP = 0.45        # only farm above this fraction of max HP
 CRATE_STANDOFF = 30.0 # shoot crates from about this far
-NPC_STANDOFF = 40.0   # shoot drones from about this far (they shoot back within ~45 m)
+NPC_STANDOFF = 0.0    # shoot drones from this far; 0 = just outside their aggro range (config npc.aggro_range + 5)
 FIGHT_RANGE = 0.0     # >0: keep this distance in fights. 80 scored 3.18 for real (vs sim 3.40): off for now
+USE_BEAMS = True      # laser/lightning beams reveal where the shooter is: remember them as enemies
+USE_TRIANGLE = True   # prefer targets our weapons counter (laser>mortar, lightning>laser, mortar>lightning)
+# upgrade preference (ids from hello.config.upgrades); unknown ids rank last
+UPGRADE_RANK = ["armor", "plating", "gun_damage", "gun_rate", "nanites", "lightning_efficiency", "laser_damage",
+                "laser_charge", "lightning_range", "gun_mag", "lightning_chain", "gun_velocity", "mortar_reload",
+                "servos", "reactor", "capacitor", "sensors", "gyros", "jets", "laser_pierce", "mortar_splash",
+                "mortar_velocity"]
 # Simulator experiments can override any of the constants above, e.g. MF_PARAMS='{"HUNT_HP": 0.7}'.
 # (The environment variable is never set in real matches.)
 try:
     globals().update(__import__("json").loads(os.environ.get("MF_PARAMS", "{}")))
 except ValueError:
     pass
-UPGRADE_RANK = ["armor", "plating", "nanites", "gun_damage", "gun_rate", "laser_charge", "laser_damage",
-                "lightning_damage", "gun_mag", "gun_velocity", "servos", "mortar_reload", "sensors",
-                "gyros", "reactor", "capacitor", "jets", "mortar_splash", "mortar_velocity"]
 TICK_BUDGET = 0.020  # seconds of path-planning per tick (the hard limit is 0.050)
 
 
@@ -256,6 +260,19 @@ class Bot:
             f = self.foes.setdefault(m["id"], {"dmg": 0.0, "hit_t": -99.0})
             f.update(pos=m["pos"], vel=m.get("vel", [0, 0, 0]), hp=m.get("hp", 1400),
                      max_hp=m.get("max_hp", 1400), t=t)
+        # beams give away the shooter's position, even when we can't see them
+        if USE_BEAMS:
+            for b in obs.get("beams", []):
+                by = b.get("by")
+                if by is None or by >= 100 or by == me["id"] or not b.get("path"):
+                    continue
+                f = self.foes.setdefault(by, {"dmg": 0.0, "hit_t": -99.0})
+                bt = t - b.get("age", 0.0)
+                if bt > f.get("t", -99.0) + 0.3:   # don't overwrite a fresher sighting
+                    p = b["path"][0]
+                    f.update(pos=[p[0], p[1], p[2] - 7.0], vel=[0.0, 0.0, 0.0], t=bt)
+                    f.setdefault("hp", 1400)
+                    f.setdefault("max_hp", 1400)
         for k in [k for k, f in self.foes.items() if t - f.get("t", -99) > 12 and t - f.get("hit_t", -99) > 12]:
             del self.foes[k]
         active = [(k, f) for k, f in self.foes.items()
@@ -355,7 +372,8 @@ class Bot:
         # farming: stop at a safe distance once we can shoot it
         if mode == "farm" and self.farm is not None:
             kind, _, fp = self.farm
-            sd = CRATE_STANDOFF if kind == "crate" else NPC_STANDOFF
+            # drones only shoot mechs inside their aggro range: stand just outside it
+            sd = CRATE_STANDOFF if kind == "crate" else (NPC_STANDOFF or self.cfg["npc"].get("aggro_range", 45) + 5)
             muzzle = (x, y, zf + st.get("muzzle_height", 7))
             if math.dist(fp[:2], (x, y)) < sd and self.nav.los(muzzle, (fp[0], fp[1], fp[2] + 1.2)):
                 mv = (0.0, 0.0)
@@ -429,13 +447,25 @@ class Bot:
             self.target_id = None
             return None
         muzzle = (x, y, zf + me["stats"].get("muzzle_height", 7))
+        mine = {w["kind"] for w in me["weapons"] if w}
+        gun_range = next((w["stats"].get("range", 230) for w in me["weapons"] if w and w["kind"] == "gun"), 230)
         best, bs = None, 1e18
         for m in enemies:
             d = m["_d"]
             hp = m.get("hp", 1400)
             p = m["pos"]
-            hit = max(0.15, 1.0 - d / 220.0)            # rough chance a gun shot lands at this range
+            hit = max(0.15, 1.0 - d / (gun_range * 0.95))  # rough chance a gun shot lands at this range
             s = hp / hit
+            if USE_TRIANGLE:
+                theirs = set(m.get("weapons", []))
+                if "laser" in mine and "mortar" in theirs:
+                    s *= 0.75                            # cook-off: +60% laser damage on mortar carriers
+                if "lightning" in mine and "laser" in theirs and d < 50:
+                    s *= 0.8                             # our lightning shorts their laser
+                if "mortar" in mine and "lightning" in theirs:
+                    s *= 0.85                            # concussion keeps lightning out of range
+                if ("lightning" in theirs and "laser" in mine and d < 50) or ("laser" in theirs and "mortar" in mine):
+                    s *= 1.15                            # they counter us: prefer someone else
             if not self.nav.los(muzzle, (p[0], p[1], p[2] + 4.5)):
                 s *= 3.0                                 # can't shoot it from here
             if hp < 200:
