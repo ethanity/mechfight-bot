@@ -29,7 +29,7 @@ FARM_RANGE = 140.0    # how far we'll go for a drone or crate
 FARM_HP = 0.45        # only farm above this fraction of max HP
 CRATE_STANDOFF = 30.0 # shoot crates from about this far
 NPC_STANDOFF = 40.0   # shoot drones from about this far (they shoot back within ~45 m)
-FIGHT_RANGE = 80.0    # in fights keep about this distance (house bots miss more at range; 0 = close to CLOSE_IN)
+FIGHT_RANGE = 0.0     # >0: keep this distance in fights. 80 scored 3.18 for real (vs sim 3.40): off for now
 # Simulator experiments can override any of the constants above, e.g. MF_PARAMS='{"HUNT_HP": 0.7}'.
 # (The environment variable is never set in real matches.)
 try:
